@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -890,15 +891,248 @@ fn generate_cancellable(
     }
     let service =
         crate::desktop::opencode_service::find().map_err(|missing| eyre!(missing.message()))?;
-    generate_with_candidates(
-        prompt,
-        model,
-        || ranked_candidates_for(&service),
-        started,
+    let workspace = crate::app_paths::opencode_workspace()?;
+
+    // The one-shot generate endpoint (/api/experimental/generate) is subject
+    // to a per-account free-tier quota that the interactive session path is
+    // not. Route post-processing through a session so it keeps working on the
+    // free tier.
+    let candidates: Vec<Model> = if let Some(m) = model {
+        vec![m.clone()]
+    } else {
+        ranked_candidates_for(&service)
+    };
+
+    if candidates.is_empty() {
+        return Err(eyre!("no OpenCode models available"));
+    }
+
+    let mut last_error = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(eyre!("OpenCode generation was cancelled"));
+        }
+        let remaining = match remaining_generation_deadline(started, deadline) {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+
+        match generate_via_session(
+            &service,
+            &workspace,
+            prompt,
+            candidate,
+            remaining,
+            cancelled,
+            started,
+            deadline,
+        ) {
+            Ok(text) if !text.trim().is_empty() => return Ok(text.trim().to_string()),
+            Ok(_) => {
+                last_error = Some(eyre!("processor returned empty text"));
+            }
+            Err(error) => {
+                if index + 1 < candidates.len() {
+                    tracing::warn!(
+                        provider = %candidate.provider,
+                        model = %candidate.id,
+                        %error,
+                        "ranked OpenCode model failed; trying next available candidate"
+                    );
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| eyre!("no OpenCode models available")))
+}
+
+/// Run one generation through an interactive session instead of the one-shot
+/// generate endpoint, which is subject to a stricter free-tier quota.
+fn generate_via_session(
+    service: &Service,
+    workspace: &Path,
+    prompt: &str,
+    model: &Model,
+    deadline: Duration,
+    cancelled: &AtomicBool,
+    started: Instant,
+    overall_deadline: Duration,
+) -> Result<String> {
+    // 1. Create a session bound to the requested model.
+    let mut model_json = serde_json::json!({
+        "id": model.id,
+        "providerID": model.provider,
+    });
+    if let Some(variant) = &model.variant {
+        model_json["variant"] = serde_json::json!(variant);
+    }
+    let create_body = serde_json::json!({
+        "model": model_json,
+    });
+    let create_body = serde_json::to_vec(&create_body)?;
+    let response = service.request(
+        "POST",
+        "/api/session",
+        Some(&create_body),
+        Some(workspace),
         deadline,
         cancelled,
-        |data, remaining, cancelled| post_generation(&service, data, remaining, cancelled),
-    )
+    )?;
+    if !(200..300).contains(&response.status) {
+        let msg = String::from_utf8_lossy(&response.body);
+        return Err(eyre!("OpenCode session creation failed: {msg}"));
+    }
+    let session: serde_json::Value = serde_json::from_slice(&response.body)
+        .wrap_err("OpenCode returned an invalid session response")?;
+    let session_id = session["data"]["id"]
+        .as_str()
+        .ok_or_else(|| eyre!("OpenCode session response missing ID"))?
+        .to_string();
+
+    // 2. Send the prompt.
+    let prompt_body = serde_json::json!({"text": prompt});
+    let prompt_body = serde_json::to_vec(&prompt_body)?;
+    let response = service.request(
+        "POST",
+        &format!("/api/session/{}/prompt", session_id),
+        Some(&prompt_body),
+        Some(workspace),
+        deadline.max(Duration::from_millis(1)),
+        cancelled,
+    )?;
+    if !(200..300).contains(&response.status) {
+        let msg = String::from_utf8_lossy(&response.body);
+        let _ = service.request(
+            "DELETE",
+            &format!("/api/session/{}", session_id),
+            None,
+            None,
+            Duration::from_secs(5),
+            cancelled,
+        );
+        return Err(eyre!("OpenCode prompt failed: {msg}"));
+    }
+
+    // 3. Wait for the session agent loop to become idle (server-side blocking,
+    //    avoids polling latency).
+    let remaining = overall_deadline.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        let _ = service.request(
+            "POST",
+            &format!("/api/session/{}/interrupt", session_id),
+            None,
+            None,
+            Duration::from_secs(5),
+            cancelled,
+        );
+        let _ = service.request(
+            "DELETE",
+            &format!("/api/session/{}", session_id),
+            None,
+            None,
+            Duration::from_secs(5),
+            cancelled,
+        );
+        return Err(eyre!(
+            "OpenCode generation exceeded {} seconds",
+            overall_deadline.as_secs()
+        ));
+    }
+    let wait_result = service.request(
+        "POST",
+        &format!("/api/experimental/session/{}/wait", session_id),
+        None,
+        None,
+        remaining,
+        cancelled,
+    );
+    if cancelled.load(Ordering::Acquire) {
+        let _ = service.request(
+            "POST",
+            &format!("/api/session/{}/interrupt", session_id),
+            None,
+            None,
+            Duration::from_secs(5),
+            cancelled,
+        );
+        let _ = service.request(
+            "DELETE",
+            &format!("/api/session/{}", session_id),
+            None,
+            None,
+            Duration::from_secs(5),
+            cancelled,
+        );
+        return Err(eyre!("OpenCode generation was cancelled"));
+    }
+    let _ = wait_result; // Ignore wait errors; we'll still try to read the messages below.
+
+    let remaining = overall_deadline.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        let _ = service.request(
+            "POST",
+            &format!("/api/session/{}/interrupt", session_id),
+            None,
+            None,
+            Duration::from_secs(5),
+            cancelled,
+        );
+        let _ = service.request(
+            "DELETE",
+            &format!("/api/session/{}", session_id),
+            None,
+            None,
+            Duration::from_secs(5),
+            cancelled,
+        );
+        return Err(eyre!(
+            "OpenCode generation exceeded {} seconds",
+            overall_deadline.as_secs()
+        ));
+    }
+
+    // 4. Read the assistant's text response.
+    let mut text_result: Option<String> = None;
+    let response = service.request(
+        "GET",
+        &format!("/api/session/{}/message?type=assistant", session_id),
+        None,
+        None,
+        Duration::from_secs(5),
+        cancelled,
+    )?;
+    if (200..300).contains(&response.status) {
+        let messages: serde_json::Value = serde_json::from_slice(&response.body).unwrap_or_default();
+        if let Some(data) = messages.get("data").and_then(|d| d.as_array()) {
+            for msg in data {
+                if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                    for item in content {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                                if !t.trim().is_empty() {
+                                    text_result = Some(t.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Clean up the session.
+    let _ = service.request(
+        "DELETE",
+        &format!("/api/session/{}", session_id),
+        None,
+        None,
+        Duration::from_secs(5),
+        cancelled,
+    );
+
+    Ok(text_result.unwrap_or_default())
 }
 
 fn generate_with_candidates(
