@@ -957,7 +957,12 @@ fn generate_cancellable(
             started,
             deadline,
         ) {
-            Ok(text) if !text.trim().is_empty() => return Ok(text.trim().to_string()),
+            Ok(text) if !text.trim().is_empty() => {
+                return Ok(Generated {
+                    text: text.trim().to_string(),
+                    model: Some(candidate.clone()),
+                })
+            }
             Ok(_) => {
                 last_error = Some(eyre!("processor returned empty text"));
             }
